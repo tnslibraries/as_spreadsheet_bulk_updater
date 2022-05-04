@@ -77,6 +77,12 @@ class SpreadsheetBulkUpdater
         create_missing_top_containers(top_containers_in_sheet, job)
       end
 
+      # let's make sure we have all the digital objects we care about
+      if subrecord_columns[:digital_object]
+        digital_objects_in_sheet = extract_digital_objects_from_sheet(filename, subrecord_columns[:digital_object])
+        @digital_object_id_to_uri_map = apply_digital_objects_changes(digital_objects_in_sheet, job, db)
+      end
+
       batch_rows(filename) do |batch|
         to_process = batch.map{|row| [Integer(row.fetch('id')), row]}.to_h
 
@@ -104,6 +110,7 @@ class SpreadsheetBulkUpdater
 
     subrecord_updates_by_index = {}
     instance_updates_by_index = {}
+    digital_object_updates_by_index = {}
     related_accession_updates_by_index = {}
     lang_material_updates_by_index = {:language_and_script => {}, :note_langmaterial => {}}
 
@@ -120,19 +127,15 @@ class SpreadsheetBulkUpdater
           record_changed = apply_archival_object_column(row, column, path, value, ao_json) || record_changed
 
           # notes
-        elsif column.is_a?(SpreadsheetBuilder::NoteContentColumn) || SpreadsheetBuilder::EXTRA_NOTE_FIELDS.has_key?(column.jsonmodel)
-          note_type = nil
-          note_jsonmodel = nil
+        elsif path.start_with?('note/')
+          if path =~ /note\/([a-z_-]+)\/.*/
+            note_type = $1
+            note_jsonmodel = SpreadsheetBuilder.note_jsonmodel_for_type(note_type)
 
-          if column.is_a?(SpreadsheetBuilder::NoteContentColumn)
-            note_type = column.name
-            note_jsonmodel = column.note_jsonmodel
-          elsif SpreadsheetBuilder::EXTRA_NOTE_FIELDS.has_key?(column.jsonmodel)
-            note_type = column.jsonmodel
-            note_jsonmodel = SpreadsheetBuilder::MULTIPART_NOTES_OF_INTEREST.include?(note_type) ? 'note_multipart' : 'note_singlepart'
+            record_changed = apply_notes_column(row, column, value, ao_json, notes_by_type, note_jsonmodel, note_type) || record_changed
+          else
+            raise "note column path doesn't comply with note/{note_type}/{field}: #{path}"
           end
-
-          record_changed = apply_notes_column(row, column, value, ao_json, notes_by_type, note_jsonmodel, note_type) || record_changed
 
           # subrecords
         elsif SpreadsheetBuilder::SUBRECORDS_OF_INTEREST.include?(column.jsonmodel)
@@ -150,6 +153,14 @@ class SpreadsheetBulkUpdater
           clean_value = column.sanitise_incoming_value(value)
 
           instance_updates_by_index[column.index][column.name.to_s] = clean_value
+
+        # digital objects
+        elsif column.jsonmodel == :digital_object
+          digital_object_updates_by_index[column.index] ||= {}
+
+          clean_value = column.sanitise_incoming_value(value)
+
+          digital_object_updates_by_index[column.index][column.name.to_s] = clean_value
 
         # related accessions
         elsif column.jsonmodel == :related_accession
@@ -171,8 +182,8 @@ class SpreadsheetBulkUpdater
 
       record_changed = apply_sub_record_updates(row, ao_json, subrecord_updates_by_index) || record_changed
 
-      unless instance_updates_by_index.empty?
-        record_changed = apply_instance_updates(row, ao_json, instance_updates_by_index) || record_changed
+      unless instance_updates_by_index.empty? && digital_object_updates_by_index.empty?
+        record_changed = apply_instance_updates(row, ao_json, instance_updates_by_index, digital_object_updates_by_index) || record_changed
       end
 
       if SpreadsheetBuilder.related_accessions_enabled?
@@ -189,6 +200,7 @@ class SpreadsheetBulkUpdater
       if record_changed
         ao_json['position'] = nil
         ao.update_from_json(ao_json)
+
         job.write_output("Updated archival object #{ao.id} - #{ao_json.display_string}")
         updated_uris << ao_json['uri']
       end
@@ -236,6 +248,12 @@ class SpreadsheetBulkUpdater
     else
       clean_value = column.sanitise_incoming_value(value)
 
+      # component_id is tricky as it has a default value of "", so we need to
+      # assume nil is actually "".
+      if path == 'component_id' && clean_value.nil?
+        clean_value = ''
+      end
+
       if ao_json[path] != clean_value
         record_changed = true
         ao_json[path] = clean_value
@@ -261,9 +279,7 @@ class SpreadsheetBulkUpdater
       # we need to create a new note!
       record_changed = true
 
-      note_to_update = SUBRECORD_DEFAULTS.fetch(note_jsonmodel.to_s, {}).merge({
-                                                                                 'type' => note_type.to_s,
-                                                                               })
+      note_to_update = default_record_values(note_jsonmodel).merge('type' => note_type.to_s)
 
       notes_by_type[note_type][column.index] = note_to_update
       ao_json.notes << note_to_update
@@ -302,10 +318,10 @@ class SpreadsheetBulkUpdater
           record_changed = true
 
           if column.multipart?
-            note_to_update['subnotes'] << SUBRECORD_DEFAULTS.fetch('note_text', {}).merge({
-                                                                                            'jsonmodel_type' => 'note_text',
-                                                                                            'content' => clean_value
-                                                                                          })
+            note_to_update['subnotes'] << default_record_values('note_text').merge({
+                                                                                    'jsonmodel_type' => 'note_text',
+                                                                                    'content' => clean_value
+                                                                                   })
           else
             note_to_update['content'] << clean_value
           end
@@ -313,9 +329,14 @@ class SpreadsheetBulkUpdater
 
       # Update the extra note field
       else
-        # FIXME Assuming the column property name gives the path on the note
-        note_to_update[column.property_name.to_s] ||= {}
-        note_path_to_update = note_to_update[column.property_name.to_s]
+        note_path_to_update = nil
+        if column.property_name.to_s == 'note'
+          note_path_to_update =  note_to_update
+        else
+          # column property name gives the path to a nested record on the note
+          note_to_update[column.property_name.to_s] ||= {}
+          note_path_to_update =  note_to_update[column.property_name.to_s]
+        end
 
         if column.name.to_s == 'local_access_restriction_type'
           # this is an array!
@@ -330,6 +351,12 @@ class SpreadsheetBulkUpdater
     end
 
     record_changed
+  end
+
+  def default_record_values(jsonmodel_type)
+    return {} unless SUBRECORD_DEFAULTS.has_key?(jsonmodel_type.to_s)
+
+    Marshal.load(Marshal.dump(SUBRECORD_DEFAULTS.fetch(jsonmodel_type.to_s)))
   end
 
   def apply_sub_record_updates(row, ao_json, subrecord_updates_by_index)
@@ -379,7 +406,7 @@ class SpreadsheetBulkUpdater
           end
 
           record_changed = true
-          subrecord_to_create = SUBRECORD_DEFAULTS.fetch(jsonmodel_property.to_s, {}).merge(subrecord_updates)
+          subrecord_to_create = default_record_values(jsonmodel_property).merge(subrecord_updates)
 
           subrecords_to_apply << subrecord_to_create
         end
@@ -632,14 +659,21 @@ class SpreadsheetBulkUpdater
     record_changed
   end
 
-  def apply_instance_updates(row, ao_json, instance_updates_by_index)
+  def apply_instance_updates(row, ao_json, instance_updates_by_index, digital_object_updates_by_index)
     record_changed = false
+
+    last_used_index = ao_json.instances.length
+
+    # store something to help retain instance sort order
+    ao_json.instances.each_with_index do |instance, index|
+      instance['_sort_'] = index
+    end
 
     # handle instance updates
     existing_sub_container_instances = ao_json.instances.select{|instance| instance['instance_type'] != 'digital_object'}
     existing_digital_object_instances = ao_json.instances.select{|instance| instance['instance_type'] == 'digital_object'}
     instances_to_apply = []
-    instances_changed = []
+    instances_changed = false
 
     instance_updates_by_index.each do |index, instance_updates|
       if (existing_subrecord = existing_sub_container_instances.fetch(index, false))
@@ -721,9 +755,12 @@ class SpreadsheetBulkUpdater
         record_changed = true
         instances_changed = true
 
-        instance_to_create = SUBRECORD_DEFAULTS.fetch('instance').merge(
+        instance_to_create = default_record_values('instance').merge(
           INSTANCE_FIELD_MAPPINGS.map{|target_field, spreadsheet_field| [target_field, instance_updates[spreadsheet_field]]}.to_h
         )
+
+        last_used_index += 1
+        instance_to_create['_sort_'] = last_used_index
 
         instance_to_create['sub_container'].merge!(
           SUB_CONTAINER_FIELD_MAPPINGS.map{|target_field, spreadsheet_field| [target_field, instance_updates[spreadsheet_field]]}.to_h
@@ -749,8 +786,98 @@ class SpreadsheetBulkUpdater
       end
     end
 
+    digital_object_instances_to_apply = []
+    digital_object_updates_by_index.each do |index, digital_object_updates|
+      digital_object_id = digital_object_updates['digital_object_id']
+
+      if (existing_subrecord = existing_digital_object_instances.fetch(index, false))
+        if digital_object_updates.all?{|_, value| value.to_s.empty? }
+          if SpreadsheetBulkUpdater.apply_deletes?
+            # DELETE!
+            record_changed = true
+            instances_changed = true
+          else
+            errors << {
+              sheet: SpreadsheetBuilder::SHEET_NAME,
+              column: "instances/#{index}",
+              row: row.row_number,
+              errors: ["Deleting an digital object instance is disabled. Use AppConfig[:spreadsheet_bulk_updater_apply_deletes] = true to enable."],
+            }
+          end
+
+          next
+        end
+
+        if digital_object_id.to_s.empty?
+          errors << {
+            sheet: SpreadsheetBuilder::SHEET_NAME,
+            column: "digital_object/#{index}/digital_object_id",
+            row: row.row_number,
+            errors: ["Digital Object ID is required"],
+          }
+
+          next
+        else
+          if @digital_object_id_to_uri_map.has_key?(digital_object_id)
+            digital_object_uri = @digital_object_id_to_uri_map.fetch(digital_object_id).fetch(:uri)
+
+            if existing_subrecord.fetch('digital_object').fetch('ref') != digital_object_uri
+              existing_subrecord['digital_object']['ref'] = digital_object_uri
+              instance_changed = true
+            end
+          else
+            errors << {
+              sheet: SpreadsheetBuilder::SHEET_NAME,
+              column: "digital_object/#{index}/digital_object_id",
+              row: row.row_number,
+              errors: ["Digital Object not found for #{digital_object_id}"],
+            }
+          end
+        end
+
+        # did anything change?
+        if instance_changed
+          record_changed = true
+          instances_changed = true
+        end
+
+        # ready to apply
+        digital_object_instances_to_apply << existing_subrecord
+      else
+        if digital_object_updates.values.all?{|v| v.to_s.empty? }
+          # Nothing to do!
+          next
+        end
+
+        record_changed = true
+        instances_changed = true
+
+        if @digital_object_id_to_uri_map.has_key?(digital_object_id)
+          instance_to_create = {
+            'jsonmodel_type' => 'instance',
+            'instance_type' => 'digital_object',
+            'digital_object' => {
+              'ref' => @digital_object_id_to_uri_map.fetch(digital_object_id).fetch(:uri)
+            }
+          }
+
+          last_used_index += 1
+          instance_to_create['_sort_'] = last_used_index
+
+          digital_object_instances_to_apply << instance_to_create
+        else
+          errors << {
+            sheet: SpreadsheetBuilder::SHEET_NAME,
+            column: "digital_object/#{index}/digital_object_id",
+            row: row.row_number,
+            errors: ["Digital Object not found for #{digital_object_id}"],
+          }
+        end
+      end
+    end
+
     if instances_changed
-      ao_json.instances = instances_to_apply + existing_digital_object_instances
+      ao_json.instances = (instances_to_apply + digital_object_instances_to_apply).sort_by{|instance| instance['_sort_']}.map{|instance| instance.delete('_sort_'); instance}
     end
 
     record_changed
@@ -808,6 +935,24 @@ class SpreadsheetBulkUpdater
     end
   end
 
+  DigitalObjectCandidate = Struct.new(:digital_object_id, :digital_object_title, :digital_object_publish, :file_version_file_uri, :file_version_caption, :file_version_publish) do
+    def empty?
+      members.all?{|attr| self[attr].to_s.empty?}
+    end
+
+    def link_only?
+      !self.digital_object_id.to_s.empty? && (members - [:digital_object_id]).all?{|attr| self[attr].to_s.empty?}
+    end
+
+    def to_s
+      "#<SpreadsheetBulkUpdater::DigitalObjectCandidate #{self.to_h.inspect}>"
+    end
+
+    def inspect
+      to_s
+    end
+  end
+
   AccessionCandidate = Struct.new(:id_0, :id_1, :id_2, :id_3) do
     def empty?
       id_0.nil? && id_1.nil? && id_2.nil? && id_3.nil?
@@ -839,6 +984,137 @@ class SpreadsheetBulkUpdater
 
       @top_containers_in_resource[candidate_to_create] = tc.uri
     end
+  end
+
+  def apply_digital_objects_changes(in_sheet, job, db)
+    identifiers_by_digital_object_id = {}
+
+    # NOTE: digital_object_id is unique within the repository!
+    #
+    # Check if any of the digital objects referenced in the spreadsheet
+    # already exist.
+    candidate_ids = in_sheet.keys.map{|candidate| candidate.digital_object_id}.uniq.compact
+    db[:digital_object]
+    .filter(:digital_object_id => candidate_ids)
+    .select(:id, :repo_id, :digital_object_id)
+    .each do |row|
+      identifiers_by_digital_object_id[row[:digital_object_id]] = {
+        uri: JSONModel::JSONModel(:digital_object).uri_for(row[:id], :repo_id => row[:repo_id]),
+        id: row[:id]
+      }
+    end
+
+    candidates_for_update = {}
+
+    in_sheet.keys.each do |digital_object_candidate|
+      # no values! move on...
+      next if digital_object_candidate.empty?
+
+      digital_object_exists = identifiers_by_digital_object_id.include?(digital_object_candidate.digital_object_id)
+
+      # allow linking to a digital object with its ID alone i.e. no updates!
+      next if digital_object_candidate.link_only? && digital_object_exists
+
+      if digital_object_exists
+        # Digital object exists for this digital_object_id! So stash it and we'll
+        # check it for changes in a moment...
+        candidates_for_update[identifiers_by_digital_object_id.fetch(digital_object_candidate.digital_object_id).fetch(:id)] = digital_object_candidate
+      else
+        # No digital object exists with this digital_object_id,
+        # so we better create a new one.
+        do_json = JSONModel::JSONModel(:digital_object).new #._always_valid!
+        do_json.digital_object_id = digital_object_candidate.digital_object_id
+        do_json.title = digital_object_candidate.digital_object_title
+        do_json.publish = digital_object_candidate.digital_object_publish
+        unless [digital_object_candidate.file_version_file_uri, digital_object_candidate.file_version_caption].all?{|v| v.to_s.empty?}
+          do_json.file_versions = [{
+                                     'jsonmodel_type' => 'file_version',
+                                     'file_uri' => digital_object_candidate.file_version_file_uri,
+                                     'caption' => digital_object_candidate.file_version_caption,
+                                     'publish' => digital_object_candidate.file_version_publish,
+                                   }]
+        end
+
+        obj = DigitalObject.create_from_json(do_json)
+
+        job.write_output("Created digital object #{do_json.digital_object_id} - #{do_json.title}")
+
+        identifiers_by_digital_object_id[digital_object_candidate.digital_object_id] = {
+          uri: obj.uri,
+          id: obj.id
+        }
+
+        updated_uris << obj.uri
+      end
+    end
+
+    unless candidates_for_update.empty?
+      # Batch update the digital objects
+      candidates_for_update.keys.each_slice(BATCH_SIZE) do |batch|
+        objs = DigitalObject.filter(:id => batch).all
+        jsons = DigitalObject.sequel_to_jsonmodel(objs)
+
+        objs.zip(jsons).each do |obj, json|
+          candidate = candidates_for_update.fetch(obj.id)
+
+          # We only want to update the digital object if we're sure the
+          # spreadsheet contains changes. So double check the record's
+          # existing values before firing an update.
+          changed = false
+
+          if json.title != candidate.digital_object_title
+            json.title = candidate.digital_object_title
+            changed = true
+          end
+
+          if json.publish != !!candidate.digital_object_publish
+            json.publish = !!candidate.digital_object_publish
+            changed = true
+          end
+
+          has_file_version_values = ![candidate.file_version_file_uri, candidate.file_version_caption].all?{|v| v.to_s.empty?}
+          if (file_version = json.file_versions.first)
+            if has_file_version_values
+              # update the file version
+              if file_version['file_uri'] != candidate.file_version_file_uri
+                file_version['file_uri'] = candidate.file_version_file_uri
+                changed = true
+              end
+
+              if file_version['caption'] != candidate.file_version_caption
+                file_version['caption'] = candidate.file_version_caption
+                changed = true
+              end
+
+              if file_version['publish'] != !!candidate.file_version_publish
+                file_version['publish'] = candidate.file_version_publish
+                changed = true
+              end
+            else
+              # delete the file version!
+              json.file_versions.delete_at(0)
+              changed = true
+            end
+          elsif has_file_version_values
+            json.file_versions << {
+              'jsonmodel_type' => 'file_version',
+              'file_uri' => candidate.file_version_file_uri,
+              'caption' => candidate.file_version_caption,
+            }
+            changed = true
+          end
+
+          if changed
+            obj.update_from_json(json)
+            job.write_output("Updated digital object #{json.digital_object_id} - #{json.title}")
+
+            updated_uris << obj.uri
+          end
+        end
+      end
+    end
+
+    identifiers_by_digital_object_id
   end
 
   def find_subrecord_columns(column_by_path)
@@ -874,6 +1150,25 @@ class SpreadsheetBulkUpdater
     end
 
     top_containers
+  end
+
+  def extract_digital_objects_from_sheet(filename, digital_object_columns)
+    digital_objects = {}
+
+    each_row(filename) do |row|
+      next if row.empty?
+      by_index = {}
+      digital_object_columns.each do |path, column|
+        by_index[column.index] ||= DigitalObjectCandidate.new
+        by_index[column.index][column.name] = column.sanitise_incoming_value(row.fetch(path))
+      end
+
+      by_index.values.reject(&:empty?).each do |digital_object|
+        digital_objects[digital_object] = nil
+      end
+    end
+
+    digital_objects
   end
 
   def extract_accessions_from_sheet(db, filename, related_accession_columns)
